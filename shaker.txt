@@ -1,0 +1,115 @@
+* Load the program into IDA, and it looks compressed/encrypted
+  - Check with 'Ent' -- doesn't look encrypted (no high entropy bits)
+  - Since I'm no expert with 'Ent', I had to be sure
+* Trace through with a debugger a bit.. get lost pretty fast, seems to be a lot of jumps
+  - Surmise that it's some kind of crazy decrypt/unpack routine (turns out to be wrong)
+* Attach Windbg to running process -- get access violations everywhere
+  - Track it down to a whole bunch of reads to 00000000 (anti-debugging technique, I assume)
+  - Disable the specific debug event in WinDBG, loads fine
+  - WinDBG command: sxi av
+* Load in OllyDbg, use OllyDump to write the in-memory version to disk
+* Load in-memory version in IDA, poke around a little.. looks mostly the same
+* Run through 'Ent' -- entropy looks almost identical
+* Compare packed/unpacked, find they're reasonably the same
+  -> Hypothesize that it isn't packed, just obtuse :)
+  -> Might be obfuscated, though
+* Realize I wasted time pursuing this path.. ohwell :)
+
+* Explore the code a bit in IDA
+  - Tracked down where SetDlgItemTextA is called from, IDA leaves a lot to be desired on this code. :)
+  - Chased down a lot of 'jmp' and 'call' instructions going everywhere, yet nowhere
+  - Start to understand how the stack is being modified, a little
+    -> eg. after nearly every 'call', there's a 'lea esp, [esp+4]', which effectively negates the call. 
+       That's when I disabled the function-creating code in IDA. 
+* Use Spy++ to get a better idea what's being read/written by the GetDlg*/SetDlg* functions
+* Track down what's being read after 'Check' check is pressed:
+  - GetDlgItemInt() is called on the serial (first)
+  - GetDlgItemTextA() is called on the username (esi = the regcode, at the time of the call) (second)
+* Put a 'ba' on the address where the username is stored
+  - Notice that it's only read if a valid integer code is given
+  - Find that every character is read in the same location, and nowhere else -- must be a loop!
+* Investigate the entire loop from the time it reads one character to the next:
+  - WinDBG command: .while(@eip != 45b414) { u eip eip+1; t}; .echo 'we made it!'
+  - Alternate WinDBG command I ended up not using: .while(@eip != 45b414) { .if(@eip < 600000 & 	by(@eip) != 0xEB & 	by(@eip) != 0xE9 & 	wo(@eip) != 0xE9F3 & 	wo(@eip) != 0xE9F2 & 	dwo(@eip) != 0x000000a1 & 	wo(@eip) != 0xEBF2 & wo(@eip) != EBF3 & 	(by(@eip) != 0xE8 | dwo(@eip+5) != 0x0424648d) & 	(wo(@eip) != 0xE8F3 | dwo(@eip+6) != 0x0424648d) & 	(wo(@eip) != 0xE8F3 | dwo(@eip+6) != 0x0424648d) & 	dwo(@eip) != 0x0424648d) { u eip eip+1; }; t}; .echo 'we made it!'
+  - Write to a file for each letter, 'R', 'o', and 'n'
+* Use a pile of regular expressions to remove the crap:
+  - ^image.*\n                             -- WinDBG prints the location in the PE every second line.. we don't care
+  - ^ntdll.*\n                             -- WinDBG prints the location in the PE every second line.. we don't care
+  - ^.........e9.*\n                       -- jmp (4 byte)
+  - ^.........f3e9.*\n                     -- repne jmp
+  - ^.........f2e9.*\n                     -- rep jmp
+  - ^.........eb.*\n                       -- jmp (1 byte)
+  - ^.........f2eb.*\n                     -- repne jmp
+  - ^.........f3eb.*\n                     -- rep jmp
+  - ^.........e8.*\n.*lea     esp,.*\n     -- call followed by a stack change (lea esp, [esp+4])
+  - ^.........f2e8.*\n.*lea     esp,.*\n   -- repne call
+  - ^.........f3e8.*\n.*lea     esp,.*\n   -- rep call
+  -> These don't remove *all* the redundant stuff, but a pretty good majority of it
+* Manually find the calls that mov eax, [0000000] -- in machine code, a100000000
+  - Remove the error handling code, including the error handler in shaker.exe
+* Remove the error handling code, too -- it doesn't appear to be useful
+* Compare the path taken by 'R', 'o', and 'n'
+  - A couple minor jumps are different, but the overall code is identical. Awesome sign!
+  -> Would have been *way* harder if different letters took different paths
+* Next, find the route taken on the final byte (the '\0') between reading it and calling SetDlgItemTextA("Invalid serial!")
+  - WinDBG command: .while(@eip != 773dc54f) { u eip eip+1; t}; .echo 'we made it!'
+  - Remove the crap with the same regular expressions
+  - Result:
+    - 004c9a25 80fa00          cmp     dl,0
+    - 00451350 0f848ea90c00    je      image00400000+0x11bce4 (0051bce4) -- This is where the final NULL byte takes a different course
+* Reverse every jump below that comparison, one by one, until we get a different message
+  - Ignore everything but je/jne -- those are the most likely jumps for a proper comparison
+  - Recognized this sequence as soon as I saw it (confirmed with a debugger):
+  - 00457f33 85f6            test    esi,esi
+  - 004449ba 0f845756feff    je      image00400000+0x2a017 (0042a017)   ---- FORCE JUMP = GOOD SERIAL
+  -> When I forced 4449ba to jmp (90e95756feff), it says "Good serial!" -- Perfect!
+  -> Successfully cracked it! .. now for the Keygen :)
+* Start trying to find the useless code
+  - Start setting 'esi' to 0 manually higher and higher, to see where it's modified last
+  - Determine that setting 'esi' to 0 immediately after reading the current character will do it
+  - WinDBG command: bp 0045b412 "r esi=0; g;"
+  -> Conclude that everything that happens to esi does so between the end-of-string check and the bottom of the loop
+* Clean up the code in the 'R' handler
+  - Determine that the only registers used in the whole transaction are eax, edx, ebx, esi
+  -> eax is initialized to the length of the string
+  -> ebx is 0
+  -> edx (actually, dl) is set to the current character
+  -> esi is the code typed by the user
+  - Remove all code that doesn't modify one of them (then convert to C, collapse like operations, and debug till it works)
+  -> result:
+     edx = (edx & 0xFFFFFF00) | (str[i] & 0x000000FF);
+     edx = _rotl((((edx ^ eax) + 0x7b) ^ 0x3db) + 0x159, 4);
+     eax = eax ^ 0x34403;
+     ebx = ebx ^ edx;
+     esi = esi ^ ebx;
+* Set up a quick debug script to check 'esi' at the end of the run (so I can compare to my own values)
+  - WinDBG command: bp 004449ba "r esi; g;"
+  - Values match! ...eventually!
+* Create a bruteforcer:
+	unsigned int i;
+	for(i = 0; i < 0xFFFFFFFF; i++)
+	{
+		if(calc_forward(str, i) == 0)
+			return i;
+	}
+	return 0;
+* Try with a pile of test values, everything works! 
+   Forward:
+   'R'   = 0001a4a0 -- 0001a4a0
+   'Ro'  = 0031caf0 -- 0031caf0
+   'Ron' = 03006d80 -- 03006d80
+   'Big Ronnie B!' = 52ace992 -- 52ace992
+   
+   Backward:
+   'R'   = 18144
+   'Ro'  = 3156144
+   'Ron' = 50433984
+   'This' = 808001648
+   'was' = 51388480
+   'way' = 51388576
+   'too' = 51413360
+   'much' = 821559376
+   'fun!!' = 59536723
+   ':)' = 3198224
+  -> BOOM DONE NEXT
+
